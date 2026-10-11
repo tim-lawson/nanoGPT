@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torch.nn.attention.flex_attention
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -49,7 +50,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, score_mod, block_mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -59,6 +60,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if score_mod is not None:
+            y = torch.nn.attention.flex_attention.flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
@@ -93,20 +96,37 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, idx):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        if config.skip and idx <= config.n_layer / 2:
+            self.gate = nn.Sequential(nn.Linear(config.n_embd, 1, bias=True), nn.ReLU())
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, score_mod, block_mask):
+        x = x + self.attn(self.ln_1(x), score_mod, block_mask)
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, self.gate(x) if hasattr(self, 'gate') else None
+
+
+def gate_score_mod(gate):
+    if gate is None:
+        return None
+    mod = -torch.log(1 - torch.clamp(gate, 0, 1))
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score + mod[b, q_idx].squeeze()
+
+    return score_mod
+
+def causal_mask(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
 
 @dataclass
 class GPTConfig:
+    batch_size: int = 12
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
@@ -114,6 +134,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    skip: bool = False
+
 
 class GPT(nn.Module):
 
@@ -127,7 +149,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, idx) for idx in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -146,6 +168,13 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+        self.block_mask = None
+        if config.skip:
+            self.block_mask = torch.nn.attention.flex_attention.create_block_mask(
+                causal_mask, None, None, config.block_size, config.block_size, device="cpu", _compile=True
+            )
+            self.register_buffer("gate", torch.zeros(config.batch_size, config.block_size, config.n_layer), persistent=False)
 
     def get_num_params(self, non_embedding=True):
         """
@@ -177,8 +206,23 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        for block_idx, block in enumerate(self.transformer.h):
+
+            # compute score modifications for the current gating values
+            if hasattr(self, "gate"):
+                score_mod = gate_score_mod(self.gate[:, :, block_idx])
+            else:
+                score_mod = None
+
+            x, gate = block(x, score_mod, self.block_mask)
+
+            # accumulate gate values over layers \ell < L/2
+            if hasattr(self, "gate") and gate is not None:
+                if block_idx == 0:
+                    self.gate[:, :, block_idx] = gate.squeeze()
+                else:
+                    self.gate[:, :, block_idx] = self.gate[:, :, block_idx - 1] + gate.squeeze()
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
